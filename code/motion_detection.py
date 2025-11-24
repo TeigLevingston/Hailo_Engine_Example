@@ -112,7 +112,7 @@ def parse_hailo_yolo_output(raw_out, frame_shape, conf_th=0.60):
 # I will be trainng a model later with the data I collect.    
 def pascal_voc_to_yolo(x1, y1, x2, y2, image_w, image_h):
     return [((x2 + x1)/(2*image_w)), ((y2 + y1)/(2*image_h)), (x2 - x1)/image_w, (y2 - y1)/image_h]
-
+# -------------------------------Hailo configuration start_________________________#
 # I need this because of how I am doing motion detection and cropping. Most examples implement this a local
 # and then send a stream to it. That lets the model load once and works. I need the persistant instance
 # So can pass multiple frames to it without getting the hailo_platform.pyhailort.pyhailort.hailortstatus exception: 8
@@ -168,6 +168,8 @@ class HailoInferenceEngine:
         self.infer_pipe = hpf.InferVStreams(self.network_group, self.in_params, self.out_params)
         self.infer_pipe.__enter__()
 
+	# -------------------------------Hailo configuration end_________________________#
+	
         #In the main code this is the method that you call with an image as a parameter to get detections.
         #The conf_th parameter allows you to set the confidence threshold for detections.
 
