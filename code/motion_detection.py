@@ -1,7 +1,7 @@
 import os
 import time
 import cv2
-import numpy as np
+import numpy as np # Hailo SDK supports 1.23.3, not 2.x
 import atexit
 import hailo_platform as hpf  # Hailo SDK 4.20 Python bindings
 
