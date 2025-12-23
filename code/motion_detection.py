@@ -23,96 +23,6 @@ COCO80 = [
 VIDEO_PATH = "<- change to your file"  # 
 # ---------------------------------------------------------------------------
 
-# Pretty boilerplate for using OpenCV to grab a stream and frames.
-def open_video_capture(path: str):
-    cap = cv2.VideoCapture(path)
-    return cap, cap.isOpened()
-
-def read_frame(cap):
-    ok, frame = cap.read()
-    if not ok or frame is None or frame.size == 0:
-        return None
-    return frame
-	
-# Just a function to make sure the clips I pull from the stream based on the motion detection contours is 640x640, which is what the model expects
-def pad_image(img):
-    """Pad or resize an image to 640x640 with black borders, preserving BGR order."""
-    target = 640
-    h, w = img.shape[:2]
-    top = max((target - h) // 2, 0)
-    bottom = max(target - h - top, 0)
-    left = max((target - w) // 2, 0)
-    right = max(target - w - left, 0)
-    if top > 0 or bottom > 0 or left > 0 or right > 0:
-        padded = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    else:
-        padded = img
-    if padded.shape[0] != target or padded.shape[1] != target:
-        padded = cv2.resize(padded, (target, target), interpolation=cv2.INTER_NEAREST)
-    return padded
-	
-# This function returns the detection data in a format I use later.
-def parse_hailo_yolo_output(raw_out, frame_shape, conf_th=0.60):
-    """
-    Normalize Hailo YOLO postprocess outputs into:
-      {class_id, class_name, score, bbox=[x1,y1,x2,y2]} 
-
-    """
-
-    H_img, W_img = frame_shape[:2]
-
-    # Raw_Out is an array, [0] is the first element and is a list the 80 COCO classes. I could have done this before the call in line 199
-    # Note that GPT-5 couldn't figure this out. 
-    # Instead it wrote a bunch of error avoidance/type checking code that caused this to just exit gracefully.
-    # I think this is easier.
-    out = raw_out[0] 
-
-    for a in out:
-        dets = []
-        for cls_id, bucket in enumerate(out):
-            if bucket is None:
-                continue
-            arr = bucket
-            # normalize to (5, K_i)
-            # the shape of the array is determined by the model output, 
-            # for this model the output is transposed from how later methods are expecting it.
-            # I probably don't need to check since I know the dimensions of the output.
-            if hasattr(bucket, "ndim") and bucket.ndim == 2:
-
-                aT = bucket.T
-                y1, x1, y2, x2, score = aT
-
-            else:
-                # empty or non-array
-                continue
-
-            keep = (score >= conf_th) & (x2 > x1) & (y2 > y1)
-            if not np.any(keep):
-                continue
-
-            y1 = y1[keep]; x1 = x1[keep]; y2 = y2[keep]; x2 = x2[keep]; score = score[keep]
-
-            # Hailo YOLO outputs normalized boxes in [0,1] range according to their documentation. The if block makes sure that is the case and adjusts from normalized to pixels
-            if max(float(np.max(x2, initial=0)), float(np.max(y2, initial=0))) <= 1.5:
-                x1 = (x1 * W_img).astype(int); x2 = (x2 * W_img).astype(int)
-                y1 = (y1 * H_img).astype(int); y2 = (y2 * H_img).astype(int)
-            else:
-                x1 = x1.astype(int); x2 = x2.astype(int); y1 = y1.astype(int); y2 = y2.astype(int)
-
-
-            dets.append({
-				"class_id": int(cls_id),
-				"class_name": COCO80[cls_id] if 0 <= cls_id < len(COCO80) else str(cls_id),
-				"score": float(score),
-				"bbox": [int(x1), int(y1), int(x2), int(y2)]
-                })
-        return dets
-    
-# This function sopports saving the bounding box in YOLO format. I use that in YOLOLabel, which is a great tool for creating training data.
-# I will be trainng a model later with the data I collect.    
-def pascal_voc_to_yolo(x1, y1, x2, y2, image_w, image_h):
-    return [((x2 + x1)/(2*image_w)), ((y2 + y1)/(2*image_h)), (x2 - x1)/image_w, (y2 - y1)/image_h]
-
 
 # -------------------------------Hailo configuration start_________________________#
 
@@ -120,10 +30,13 @@ def pascal_voc_to_yolo(x1, y1, x2, y2, image_w, image_h):
 # I need this because of how I am doing motion detection and cropping. Most examples implement this a local
 # and then send a stream to it. That lets the model load once and works. I need the persistant instance
 # So can pass multiple frames to it without getting the hailo_platform.pyhailort.pyhailort.hailortstatus exception: 8
+
 # This is based on Hailo SDK examples and my own experiments.
 # My project is to compare the accuracy and performance of the model between using a high-resolution frame that has been resized as input, the way most stream examples work, 
 # and a  frame that was cropped, padded, and only, sometimes, resized.
+
 #If you are interested in Hailo SDK programming, I hope this is helpful.
+
 class HailoInferenceEngine:
     """Persistent Hailo YOLO inference engine.
     Loads HEF, configures device and opens InferVStreams once. Call infer(frame) to get detections.
@@ -144,13 +57,13 @@ class HailoInferenceEngine:
         # Now that the vdevice is created and configured, we can load the model onto it. The call returns a list and we need the first one.
         #This may be important later if you want to load multiple models.
         self.network_group = self.vdev.configure(self.hef, cfg)[0]
-        #This stores the network group and in/outparameters, we need them to activate the network later.
+        #This gets the network group and the in/out parameters from the hef and stores them in the device. We need them to activate the network later.
         self.ng_params = self.network_group.create_params()
         in_info = self.hef.get_input_vstream_infos()[0]
         out_info = self.hef.get_output_vstream_infos()[0]
         self.in_name, self.out_name = in_info.name, out_info.name
         self.in_shape = tuple(in_info.shape)  # (H,W,C) for NHWC
-        #This was confusing at first since the N value is implicitly 1 for batch size. We add that dimension later.
+        #This was confusing at first since the N value is implicitly 1 for batch size. We add that dimension later in the setup for an inference.
         H, W, C = self.in_shape
         # All of the above is pretty boilerplate and you can find other examples of the approach. 
 		# We are reading parameters from the model and saving them to use during activation.
@@ -164,7 +77,7 @@ class HailoInferenceEngine:
         self.out_params = hpf.OutputVStreamParams.make_from_network_group(
             self.network_group, quantized=True, format_type=hpf.FormatType.FLOAT32
         )
-        # This creates the activation context and activates them. If you debug and break through thes steps
+        # This creates the activation context and activates them. If you debug and break through these steps
         # you can see the resources being allocated on the device as local variables.
 
         self.activation = self.network_group.activate(self.ng_params)
@@ -175,7 +88,7 @@ class HailoInferenceEngine:
 	# -------------------------------Hailo configuration end_________________________#
 	
         #In the main code this is the method that you call with an image as a parameter to get detections.
-        #The conf_th parameter allows you to set the confidence threshold for detections.
+        #The conf_th parameter allows you to set the confidence threshold for detections. You should be able to set the batch size, the missing dimension from above, here but may run into some memory issues with the Hailo8
 
     def infer(self, frame_bgr: np.ndarray, conf_th: float = 0.60):
 
@@ -228,10 +141,11 @@ def run_inference(img):
 
                         
 
-# From here down is the motion detection and main loop code. I am pulling frames from an rtsp stream, 
+# From here down is the motion detection and main loop code. I am pulling frames from a ffmpeg recorded stream, 
 # Using OpenCV for motion detection and cropping. 
 # Then passing the cropped frames to the HailoInferenceEngine instance for detection.
 # This lets me keep the model loaded once and avoid the hailortstatus exception: 8
+# The detections in this version are not scaled back to the original shape, that comes in the followup
 
 
 def detect_motion():
@@ -333,7 +247,6 @@ def detect_motion():
                         for line in yolo_lines:
                             f.write(line + "\n")
 
-                print("Motion detected " + str(len(detections)))
 
             if motion_detected:
                 continue
@@ -345,9 +258,103 @@ def detect_motion():
             cap.release()
         except Exception:
             pass
-                #cv2.putText(frame1, "Motion Detected!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                #cv2.imwrite(framename + "_Frame.png", frame1) 
-                #cv2.imwrite(framename + "_Thresh.png", thresh)
+
+
+
+
+# Pretty boilerplate for using OpenCV to grab a stream and frames.
+def open_video_capture(path: str):
+    cap = cv2.VideoCapture(path)
+    return cap, cap.isOpened()
+
+def read_frame(cap):
+    ok, frame = cap.read()
+    if not ok or frame is None or frame.size == 0:
+        return None
+    return frame
+	
+# Just a function to make sure the clips I pull from the stream based on the motion detection contours is 640x640, which is what the model expects.
+def pad_image(img):
+    """Pad or resize an image to 640x640 with black borders, preserving BGR order."""
+    target = 640
+    h, w = img.shape[:2]
+    top = max((target - h) // 2, 0)
+    bottom = max(target - h - top, 0)
+    left = max((target - w) // 2, 0)
+    right = max(target - w - left, 0)
+    if top > 0 or bottom > 0 or left > 0 or right > 0:
+        padded = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    else:
+        padded = img
+# This adjusts the image if the x or y is odd
+    if padded.shape[0] != target or padded.shape[1] != target:
+        padded = cv2.resize(padded, (target, target), interpolation=cv2.INTER_NEAREST)
+    return padded
+	
+# This function returns the detection data in a format I use later.
+def parse_hailo_yolo_output(raw_out, frame_shape, conf_th=0.60):
+
+
+    H_img, W_img = frame_shape[:2]
+
+    # Raw_Out is an array, [0] is the first element and is a list the 80 COCO classe Ids. I could have done this before the call in line 199
+    # Note that GPT-5 couldn't figure this out. 
+    # Instead it wrote a bunch of error avoidance/type checking code that caused this to just exit gracefully.
+    # I think this is easier.
+    out = raw_out[0] 
+
+    for a in out:
+        dets = []
+        for cls_id, bucket in enumerate(out):
+            if bucket is None:
+                continue
+            arr = bucket
+            # normalize to (5, K_i)
+            # the shape of the array is determined by the model output, 
+            # for this model the output is transposed from how later methods are expecting it.
+            # I probably don't need to check since I know the dimensions of the output.
+            if hasattr(bucket, "ndim") and bucket.ndim == 2:
+
+                aT = bucket.T
+                y1, x1, y2, x2, score = aT
+
+            else:
+                # empty or non-array
+                continue
+
+            keep = (score >= conf_th) & (x2 > x1) & (y2 > y1)
+            if not np.any(keep):
+                continue
+
+            y1 = y1[keep]; x1 = x1[keep]; y2 = y2[keep]; x2 = x2[keep]; score = score[keep]
+
+            # Hailo YOLO outputs normalized boxes in [0,1] range according to their documentation. The if block makes sure that is the case and adjusts from normalized to pixels
+            if max(float(np.max(x2, initial=0)), float(np.max(y2, initial=0))) <= 1.5:
+                x1 = (x1 * W_img).astype(int); x2 = (x2 * W_img).astype(int)
+                y1 = (y1 * H_img).astype(int); y2 = (y2 * H_img).astype(int)
+            else:
+                x1 = x1.astype(int); x2 = x2.astype(int); y1 = y1.astype(int); y2 = y2.astype(int)
+
+
+            dets.append({
+				"class_id": int(cls_id),
+				"class_name": COCO80[cls_id] if 0 <= cls_id < len(COCO80) else str(cls_id),
+				"score": float(score),
+				"bbox": [int(x1), int(y1), int(x2), int(y2)]
+                })
+        return dets
+    
+# This function sopports saving the bounding box in YOLO format. I use that in YOLOLabel, which is a great tool for creating training data.
+# I also use it to visually inspect the results but you have to rescale the bboxes for motion detection to work. I didn't do that here. 
+# I will be trainng a model later with the data I collect.    
+def pascal_voc_to_yolo(x1, y1, x2, y2, image_w, image_h):
+    return [((x2 + x1)/(2*image_w)), ((y2 + y1)/(2*image_h)), (x2 - x1)/image_w, (y2 - y1)/image_h]
+
+
+
+
+
+
 
 
 def main():
